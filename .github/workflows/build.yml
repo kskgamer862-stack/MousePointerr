@@ -1,0 +1,471 @@
+name: Build APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          mkdir -p "$(dirname settings.gradle.kts)"
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+              plugins {
+                  id("com.android.application") version "8.5.2"
+                  id("org.jetbrains.kotlin.android") version "1.9.24"
+              }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "MousePointer"
+          include(":app")
+          EOF_FILE
+          mkdir -p "$(dirname gradle.properties)"
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2g
+          android.nonTransitiveRClass=true
+          EOF_FILE
+          mkdir -p "$(dirname app/build.gradle.kts)"
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.mousepointer"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.mousepointer"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          mkdir -p "$(dirname app/src/main/AndroidManifest.xml)"
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="true"
+                  android:label="Mouse Pointer"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".PointerService"
+                      android:exported="true"
+                      android:label="Mouse Pointer"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p "$(dirname app/src/main/res/xml/accessibility_config.xml)"
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:notificationTimeout="100"
+              android:description="@string/service_desc" />
+          EOF_FILE
+          mkdir -p "$(dirname app/src/main/res/values/strings.xml)"
+          cat > app/src/main/res/values/strings.xml <<'EOF_FILE'
+          <resources>
+              <string name="service_desc">Shows a mouse pointer and touchpad. Used only to tap, swipe and scroll where the pointer is.</string>
+          </resources>
+          EOF_FILE
+          mkdir -p "$(dirname app/src/main/java/com/example/mousepointer/MainActivity.kt)"
+          cat > app/src/main/java/com/example/mousepointer/MainActivity.kt <<'EOF_FILE'
+          package com.example.mousepointer
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 96, 48, 48)
+                  }
+                  box.addView(TextView(this).apply {
+                      textSize = 18f
+                      text = "Mouse Pointer\n\n1. Tap the button below.\n" +
+                          "2. Open 'Installed apps' (or 'Downloaded apps') > Mouse Pointer.\n" +
+                          "3. Turn it ON and allow.\n\n" +
+                          "A pointer and a touchpad will appear. To stop, turn the service OFF."
+                  })
+                  box.addView(Button(this).apply {
+                      text = "Open Accessibility Settings"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+                  setContentView(box)
+              }
+          }
+          EOF_FILE
+          mkdir -p "$(dirname app/src/main/java/com/example/mousepointer/PointerService.kt)"
+          cat > app/src/main/java/com/example/mousepointer/PointerService.kt <<'EOF_FILE'
+          package com.example.mousepointer
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Context
+          import android.content.res.Configuration
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.util.DisplayMetrics
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import kotlin.math.abs
+
+          class PointerService : AccessibilityService() {
+
+              private lateinit var wm: WindowManager
+              private val handler = Handler(Looper.getMainLooper())
+              private var cursor: View? = null
+              private var pad: FrameLayout? = null
+              private lateinit var cLp: WindowManager.LayoutParams
+              private lateinit var pLp: WindowManager.LayoutParams
+
+              private var sw = 0
+              private var sh = 0
+              private var cx = 0f
+              private var cy = 0f
+              private var speed = 2f
+              private var collapsed = false
+              private var padOnEnd = true
+
+              // touchpad state
+              private var lastX = 0f
+              private var lastY = 0f
+              private var moved = 0f
+              private var downTime = 0L
+              private var scrolling = false
+              private var sdx = 0f
+              private var sdy = 0f
+
+              // hold/drag state (for games: joysticks, camera look, sliders)
+              private var holding = false
+              private var busy = false
+              private var stroke: GestureDescription.StrokeDescription? = null
+              private var hx = 0f
+              private var hy = 0f
+              private var holdBtn: TextView? = null
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private val toolbarH get() = dp(44)
+              private val padH get() = if (collapsed) toolbarH else dp(200)
+              private val padW get() = minOf(dp(300), sw)
+
+              private fun updateScreen() {
+                  val m = DisplayMetrics()
+                  wm.defaultDisplay.getRealMetrics(m)
+                  sw = m.widthPixels
+                  sh = m.heightPixels
+              }
+
+              override fun onServiceConnected() {
+                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  updateScreen()
+                  cx = sw / 2f
+                  cy = sh / 3f
+                  addCursor()
+                  addPad()
+              }
+
+              override fun onConfigurationChanged(newConfig: Configuration) {
+                  super.onConfigurationChanged(newConfig)
+                  if (pad == null) return
+                  updateScreen()
+                  pLp.width = padW
+                  wm.updateViewLayout(pad, pLp)
+                  moveCursor()
+              }
+
+              private fun baseLp(w: Int, h: Int, extraFlags: Int) = WindowManager.LayoutParams(
+                  w, h,
+                  WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                  WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or extraFlags,
+                  PixelFormat.TRANSLUCENT
+              )
+
+              private class CursorView(ctx: Context) : View(ctx) {
+                  private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
+                  private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.BLACK; style = Paint.Style.STROKE; strokeWidth = 3f
+                  }
+                  override fun onDraw(c: Canvas) {
+                      val s = width / 24f
+                      val p = Path().apply {
+                          moveTo(3 * s, 2 * s); lineTo(10 * s, 21 * s)
+                          lineTo(12.6f * s, 13.4f * s); lineTo(20 * s, 11 * s); close()
+                      }
+                      c.drawPath(p, fill); c.drawPath(p, line)
+                  }
+              }
+
+              private fun addCursor() {
+                  cursor = CursorView(this)
+                  cLp = baseLp(dp(30), dp(30), WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = cx.toInt(); y = cy.toInt()
+                  }
+                  wm.addView(cursor, cLp)
+              }
+
+              private fun moveCursor() {
+                  cx = cx.coerceIn(0f, sw - 2f)
+                  cy = cy.coerceIn(0f, sh - 2f)
+                  // keep the pointer out of the touchpad area (taps there would hit the pad)
+                  val inPad = if (padOnEnd) cx >= sw - padW else cx < padW
+                  if (inPad && cy >= sh - padH - 2) cy = (sh - padH - 3).toFloat()
+                  cLp.x = cx.toInt(); cLp.y = cy.toInt()
+                  wm.updateViewLayout(cursor, cLp)
+              }
+
+              private fun btn(label: String, onClick: (TextView) -> Unit) = TextView(this).apply {
+                  text = label
+                  setTextColor(Color.WHITE)
+                  textSize = 14f
+                  gravity = Gravity.CENTER
+                  setBackgroundColor(0xFF444444.toInt())
+                  layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
+                      .apply { setMargins(2, 3, 2, 3) }
+                  setOnClickListener { onClick(this) }
+              }
+
+              private fun relayoutPad() {
+                  pLp.width = padW
+                  pLp.height = padH
+                  pLp.gravity = Gravity.BOTTOM or (if (padOnEnd) Gravity.END else Gravity.START)
+                  wm.updateViewLayout(pad, pLp)
+                  moveCursor()
+              }
+
+              private fun addPad() {
+                  val p = FrameLayout(this)
+                  p.setBackgroundColor(0x99222222.toInt())
+
+                  val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  bar.addView(btn("◀") { performGlobalAction(GLOBAL_ACTION_BACK) })
+                  bar.addView(btn("●") { performGlobalAction(GLOBAL_ACTION_HOME) })
+                  bar.addView(btn("▣") { performGlobalAction(GLOBAL_ACTION_RECENTS) })
+                  holdBtn = btn("✋") { toggleHold() }
+                  bar.addView(holdBtn)
+                  bar.addView(btn("⇄") { padOnEnd = !padOnEnd; relayoutPad() })
+                  bar.addView(btn("2x") { b ->
+                      speed = if (speed >= 4f) 1f else speed + 1f
+                      b.text = "${speed.toInt()}x"
+                  })
+                  bar.addView(btn("▼") { b ->
+                      collapsed = !collapsed
+                      b.text = if (collapsed) "▲" else "▼"
+                      relayoutPad()
+                  })
+                  p.addView(bar, FrameLayout.LayoutParams(-1, toolbarH, Gravity.TOP))
+
+                  p.setOnTouchListener { _, e -> onPadTouch(e); true }
+
+                  pad = p
+                  pLp = baseLp(padW, padH, 0).apply {
+                      gravity = Gravity.BOTTOM or Gravity.END
+                  }
+                  wm.addView(p, pLp)
+              }
+
+              private fun onPadTouch(e: MotionEvent) {
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          lastX = e.x; lastY = e.y; moved = 0f
+                          downTime = SystemClock.uptimeMillis()
+                          scrolling = false; sdx = 0f; sdy = 0f
+                      }
+                      MotionEvent.ACTION_POINTER_DOWN -> {
+                          scrolling = true
+                          lastX = (e.getX(0) + e.getX(1)) / 2
+                          lastY = (e.getY(0) + e.getY(1)) / 2
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          if (e.pointerCount >= 2) {
+                              val ax = (e.getX(0) + e.getX(1)) / 2
+                              val ay = (e.getY(0) + e.getY(1)) / 2
+                              sdx += ax - lastX; sdy += ay - lastY
+                              lastX = ax; lastY = ay
+                          } else if (!scrolling) {
+                              val dx = (e.x - lastX) * speed
+                              val dy = (e.y - lastY) * speed
+                              moved += abs(dx) + abs(dy)
+                              cx += dx; cy += dy
+                              lastX = e.x; lastY = e.y
+                              moveCursor()
+                          }
+                      }
+                      MotionEvent.ACTION_UP -> {
+                          if (!holding) {
+                              if (scrolling) {
+                                  val ex = (cx - sdx * 3).coerceIn(1f, sw - 2f)
+                                  val ey = (cy + sdy * 3).coerceIn(1f, sh - 2f)
+                                  swipe(cx, cy, ex, ey, 300)
+                              } else if (moved < 15f) {
+                                  val held = SystemClock.uptimeMillis() - downTime
+                                  if (held > 500) tap(cx, cy, 700) else tap(cx, cy, 50)
+                              }
+                          }
+                          scrolling = false
+                      }
+                  }
+              }
+
+              // ---------- hold / drag mode ----------
+              private val holdCb = object : GestureResultCallback() {
+                  override fun onCompleted(g: GestureDescription?) { busy = false }
+                  override fun onCancelled(g: GestureDescription?) {
+                      busy = false
+                      if (holding) setHoldUi(false)
+                  }
+              }
+
+              private fun setHoldUi(on: Boolean) {
+                  holding = on
+                  if (!on) { handler.removeCallbacks(holdLoop); stroke = null }
+                  holdBtn?.setBackgroundColor(if (on) 0xFFC0392B.toInt() else 0xFF444444.toInt())
+              }
+
+              private fun toggleHold() {
+                  if (Build.VERSION.SDK_INT < 26) {
+                      Toast.makeText(this, "Hold mode needs Android 8+", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  if (holding) endHold() else startHold()
+              }
+
+              private fun startHold() {
+                  val path = Path().apply { moveTo(cx, cy); lineTo(cx + 0.5f, cy) }
+                  val s = GestureDescription.StrokeDescription(path, 0, 30, true)
+                  stroke = s; hx = cx + 0.5f; hy = cy
+                  busy = true
+                  setHoldUi(true)
+                  dispatchGesture(GestureDescription.Builder().addStroke(s).build(), holdCb, null)
+                  handler.postDelayed(holdLoop, 30)
+              }
+
+              private val holdLoop = object : Runnable {
+                  override fun run() {
+                      if (!holding) return
+                      if (!busy) continueHold(true)
+                      handler.postDelayed(this, 30)
+                  }
+              }
+
+              private fun continueHold(more: Boolean) {
+                  if (Build.VERSION.SDK_INT < 26) return
+                  val prev = stroke ?: return
+                  val same = cx == hx && cy == hy
+                  val path = Path().apply { moveTo(hx, hy); lineTo(cx + (if (same) 0.1f else 0f), cy) }
+                  val s = prev.continueStroke(path, 0, 30, more)
+                  stroke = s; hx = cx; hy = cy
+                  busy = true
+                  dispatchGesture(GestureDescription.Builder().addStroke(s).build(), holdCb, null)
+              }
+
+              private fun endHold() {
+                  setHoldUi(false)
+                  releaseWhenFree()
+              }
+
+              private fun releaseWhenFree() {
+                  if (busy) {
+                      handler.postDelayed({ releaseWhenFree() }, 20)
+                  } else {
+                      val prev = stroke
+                      stroke = prev ?: return
+                      continueHold(false)
+                      stroke = null
+                  }
+              }
+
+              // ---------- basic gestures ----------
+              private fun tap(x: Float, y: Float, dur: Long) {
+                  val path = Path().apply { moveTo(x, y); lineTo(x + 0.5f, y + 0.5f) }
+                  send(path, dur)
+              }
+
+              private fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, dur: Long) {
+                  val path = Path().apply { moveTo(x1, y1); lineTo(x2, y2) }
+                  send(path, dur)
+              }
+
+              private fun send(path: Path, dur: Long) {
+                  val g = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, dur))
+                      .build()
+                  dispatchGesture(g, null, null)
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              override fun onDestroy() {
+                  handler.removeCallbacksAndMessages(null)
+                  try { cursor?.let { wm.removeView(it) } } catch (_: Exception) {}
+                  try { pad?.let { wm.removeView(it) } } catch (_: Exception) {}
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MousePointer-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
